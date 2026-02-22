@@ -1,0 +1,31 @@
+AWS raw 데이터[AWS_raw.csv](사이트 다운로드:https://www.data.go.kr/data/15084696/openapi.do) - aws_daily.ds로 rds 저장(R3)
+ASOS raw 데이터[ASOS_raw.csv](사이트 다운로드:https://data.kma.go.kr/data/grnd/selectAsosRltmList.do) - asos_daily.rds로 rds 저장(R3)
+MTW raw 데이터[raw_mtw_API_2017_2025.rds](API로 다운로드) - rds 변환(R2) - mtw_raw_standard.rds로 rds 저장(R3)
+산불발생현황 데이터[raw_fire_API_2017_2025.rds](API로 다운로드) - rds 변환(R2) - fire_raw_standard.rds로 rds 저장(R3)
+기상청 제공 META 관측지점정보 데이터[META_관측지점정보.csv](사이트 다운로드:https://data.kma.go.kr/data/grnd/selectAsosRltmList.do) -
+국토교통부_행정구역시군구_경계데이터[시군구경계.shp+4개 파일](사이트 다운로드:https://www.data.go.kr/data/15125045/fileData.do) -
+===
+fire_raw_standard.rds+3(R3에서 4개 데이터를 rds 파일로 정제)
+sigungu_centroid_master.rds, stations_asos_master.rds(R4에서 생성 : 사고단위인 개별 시군구 및 위경도 자료가 없는 ASOS 자료에 각각 위경도 배정)
+sgg_asos_aws_triple_map.rds(R5에서 생성 : 개별 시군구에 대한 기상자료 join 준비를 위한 매핑 순위 북)
+final_wildfire_panel.rds(R6에서 생성 : raw data 기반 조인으로 패널 데이터화)
+df_wildfire_final_cleaned.rds(R7에서 생성 : 결측치 및 이상치 처리 후 데이터 전처리 완비)
+sgg_spatial_weights_252.rds(R8에서 생성 : 공간가중치행렬 W)
+df_annual_insurance_panel(R9에서 생성 : 일 단위 데이터를 분석을 위해 연 단위로 축약)
+
+깃허브 저장구조
+Wildfire_project
+	> Wildfire_Data
+		> raw_data - AWS_raw.csv, ASOS_raw.csv,raw_fire_API_2017_2025.rds,raw_mtw_API_2017_2025.rds
+		> meta_data - 시군구경계.shp, META_관측지점정보.csv, sigungu_centroid_master.rds, stations_asos_master.rds,
+sgg_asos_aws_triple_map.rds, sgg_spatial_weights_252.rds
+		> processed_data - fire_raw_standard.rds+3, final_wildfire_panel.rds, df_wildfire_final_cleaned.rds, df_annual_insurance_panel
+	> Wildfire_1_Setup.R
+	> Wildfire_2_API_Harvest.R
+	> Wildfire_3_Standardize.R
+	> Wildfire_4_Meta_Geocoding.R
+	> Wildfire_5_Spatial_Mapping.R
+	> Wildfire_6_Final_Join.R
+	> Wildfire_7_Preprocess_Final
+	> Wildfire_8_Spatial_W.R
+	> Wildfire_9_Annual_Lag_Panel.R
