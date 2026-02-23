@@ -1,69 +1,92 @@
 ## =========================================================
-## Wildfire_9_Annual_Lag_Panel.R
-## 목적: 보험료 산정을 위한 연간 시차(Lag-1) 패널 데이터 구축
-## 구조: t-1년 기상 요약 지표 -> t년 산불 손해액 예측
+## Wildfire_9_Annual_Lag_Panel.R 
+## 목적: safe_min/max 적용을 통한 수치적 안정성 확보
 ## =========================================================
 
-library(tidyverse)
-library(lubridate)
+df_cleaned <- readRDS("Wildfire_Data/processed_data/df_wildfire_final_cleaned.rds")
 
-# 1. 데이터 로드
+# 0. 보조 함수 선언 (근본 함수들)
 # ---------------------------------------------------------
-# [R7]에서 생성된 '최종 무결성' 데이터를 불러옵니다.
-df_cleaned <- readRDS("Wildfire_Data/processed_data/wildfire_model_ready.rds")
+safe_quantile <- function(x, probs) {
+  x <- x[is.finite(x)]
+  if (length(x) == 0) return(NA_real_)
+  as.numeric(stats::quantile(x, probs = probs, na.rm = TRUE, names = FALSE, type = 7))
+}
 
-# 2. 연간 데이터 요약 (Annual Aggregation)
+safe_min <- function(x) {
+  valid_x <- x[!is.na(x) & is.finite(x)]
+  if (length(valid_x) == 0) return(NA_real_)
+  min(valid_x)
+}
+
+safe_max <- function(x) {
+  valid_x <- x[!is.na(x) & is.finite(x)]
+  if (length(valid_x) == 0) return(NA_real_)
+  max(valid_x)
+}
+
+make_run_max <- function(x) {
+  r <- rle(x)
+  if (length(r$lengths) == 0) return(0L)
+  max(r$lengths[r$values], 0L)
+}
+
+# 1. 통합 데이터 생성
 # ---------------------------------------------------------
-message(">>> 일일 데이터를 보험 수리적 연간 지표로 요약 중...")
+message(">>> [안전 모드] 일일 데이터를 계절별/연간 리스크 지표로 통합 요약 중...")
 
 df_yearly <- df_cleaned %>%
-  mutate(year = year(date)) %>%
+  mutate(
+    year = year(date),
+    month = month(date)
+  ) %>%
   group_by(sigungu_cd, sigungu_nm, year) %>%
   summarise(
-    # [Outcomes] t년의 결과 (보험금 지급의 근거)
+    # --- [1] Outcomes (t년 결과) ---
     fire_cnt_year      = sum(fire_cnt, na.rm = TRUE),
     damage_total_year  = sum(damage_area, na.rm = TRUE),
     fire_any_year      = as.integer(any(fire_yn == 1)),
     
-    # [Features] t-1년의 위험 지표 (보험료 산정의 근거)
-    # 지상(Surface) 요약
+    # --- [2] General Weather (Safe 함수로 전면 교체) ---
     ta_sfc_mean    = mean(sfc_ta, na.rm = TRUE),
-    hm_sfc_min     = min(sfc_hm, na.rm = TRUE),   # 최저 습도가 낮을수록 위험
-    ws_sfc_max     = max(sfc_ws, na.rm = TRUE),   # 최대 풍속이 높을수록 위험
+    hm_sfc_min     = safe_min(sfc_hm),  # min -> safe_min
+    ws_sfc_max     = safe_max(sfc_ws),  # max -> safe_max
     prcp_sfc_sum   = sum(sfc_prcp, na.rm = TRUE),
-    he_sfc_mean    = mean(sfc_he, na.rm = TRUE),  # 실효습도 연간 평균
+    he_sfc_mean    = mean(sfc_he, na.rm = TRUE),
     
-    # 산악(Mountain) 요약
     ta_mtw_mean    = mean(mtw_ta, na.rm = TRUE),
-    hm_mtw_min     = min(mtw_hm, na.rm = TRUE),
-    ws_mtw_max     = max(mtw_ws, na.rm = TRUE),
+    hm_mtw_min     = safe_min(mtw_hm),  # min -> safe_min
+    ws_mtw_max     = safe_max(mtw_ws),  # max -> safe_max
     prcp_mtw_sum   = sum(mtw_prcp, na.rm = TRUE),
     he_mtw_mean    = mean(mtw_he, na.rm = TRUE),
+    
+    # --- [3] Seasonal Features (계절별 임계치) ---
+    spring_dry_days  = sum(is_dry & month %in% 3:5, na.rm = TRUE),
+    spring_ws_p95    = safe_quantile(mtw_ws[month %in% 3:5], 0.95),
+    spring_he_min    = safe_min(mtw_he[month %in% 3:5]), # 경고 발생 지점 완전 방어
+    
+    monsoon_prcp_sum = sum(sfc_prcp[month %in% 6:8], na.rm = TRUE),
+    winter_dry_days  = sum(is_dry & month %in% c(12,1,2), na.rm = TRUE),
+    
+    # --- [4] Continuity ---
+    max_consecutive_dry_days = make_run_max(is_dry),
+    max_dry_run_spring       = make_run_max(is_dry & month %in% 3:5),
     
     .groups = "drop"
   )
 
-# 3. 1년 시차(Lag-1) 변수 생성
+# 2. Lag-1 생성 및 최종 무한대 검역
 # ---------------------------------------------------------
-message(">>> t-1년 기상 변수를 t년 리스크와 매칭 중 (Lag-1)...")
+feature_cols <- setdiff(names(df_yearly), c("sigungu_cd", "sigungu_nm", "year", "fire_cnt_year", "damage_total_year", "fire_any_year"))
 
 df_annual_lagged <- df_yearly %>%
   arrange(sigungu_cd, year) %>%
   group_by(sigungu_cd) %>%
-  mutate(across(
-    # 요약된 기상 변수들에 대해서만 시차 적용
-    .cols = c(starts_with("ta_"), starts_with("hm_"), 
-              starts_with("ws_"), starts_with("prcp_"), starts_with("he_")),
-    .fns = ~ lag(.x, 1),
-    .names = "{.col}_lag1"
-  )) %>%
+  mutate(across(all_of(feature_cols), ~ lag(.x, 1), .names = "{.col}_lag1")) %>%
   ungroup() %>%
-  # 시차 데이터가 없는 첫해(예: 2017년) 데이터는 분석에서 제외
+  # [최종 방어선] 시차 적용 후 발생하는 NA/Inf를 물리적 한계값 내의 NA로 정제
+  mutate(across(contains("_lag1"), ~ if_else(is.finite(.x), .x, NA_real_))) %>%
   filter(!is.na(ta_sfc_mean_lag1))
 
-# 4. 최종 저장
-# ---------------------------------------------------------
 saveRDS(df_annual_lagged, "Wildfire_Data/processed_data/df_annual_insurance_panel.rds")
-
-message(">>> [완료] 보험 분석용 연간 패널 생성 완료!")
-message(">>> 최종 차원: ", nrow(df_annual_lagged), " 행 x ", ncol(df_annual_lagged), " 열")
+message(">>> [완료] 무결성 패널 생성 성공! (Inf 개수: ", sum(is.infinite(as.matrix(df_annual_lagged))), ")")

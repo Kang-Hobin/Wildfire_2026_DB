@@ -1,0 +1,22 @@
+[R10 Readme. Data Preprocessing & Insurance Design Logic]
+
+1. Target Proxy: Wildfire Damage Area (ha)
+   - 실제 지급액 데이터 부재로 인해 산불 피해 면적을 보험금 지급의 대리 변수로 설정.
+   - 기상 인덱스가 물리적 피해 규모를 얼마나 잘 설명하는지 측정하여 기초위험(Basis Risk) 최소화.
+
+2. Capping Logic: 100ha Maximum Limit
+   - 정책 근거: 산림청 '산불 대응단계' 규정상 100ha 이상은 '산불 3단계(대형산불)'로 분류됨.
+   - 계리적 설계: 보험 상품의 '최대 보장 한도(Limit)'를 100ha로 설정하는 비즈니스 로직 반영.
+   - 통계적 보정: 훈련 데이터(1,721건) 중 100ha 초과 사례는 2건(최대 815ha)에 불과함.(2024년에 초대형 산불 2건이 추가로 존재) 
+     극단적 영향점에 의한 회귀 계수 왜곡을 방지하기 위해 100ha로 상계(Winsorization) 처리.
+
+3. Modeling Strategy: Two-Hurdle Approach
+   - Step 1 (Occurrence): 산불 발생 여부(0, 1) 예측. 데이터의 제로 인플레이션 대응.
+   - Step 2 (Severity): 발생한 화재 중 보장 범위 내 규모(max 100ha) 예측.
+   - Transformation: 스케일 안정화를 위해 log1p(damage_capped) 변수 활용.
+
+4. Validation: Out-of-Time Split
+   - Train Set: 2017 - 2023 (1,721 obs) - 모델 학습 및 튜닝.
+   - Test Set : 2024 - 2025 (504 obs)  - 미학습 최근 데이터를 통한 인덱스 성능 검증.
+
+※ 주의: 100ha 상계는 데이터 삭제가 아닌 '보험 지급 한도'의 모델링 반영임.

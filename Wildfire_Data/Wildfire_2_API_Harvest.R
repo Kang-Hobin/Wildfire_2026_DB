@@ -56,23 +56,47 @@ parse_openapi_items_safe <- function(xml_txt){
   list(ok = TRUE, data = df, meta = list(resultCode = rc, resultMsg = rm, totalCount = totalCount))
 }
 
-# 3. [A] 산불 발생 데이터 수집 함수
-FIRE_URL <- "http://apis.data.go.kr/1400000/forestStusService/getfirestatsservice"
-
+# 3. [A] 산불 발생 데이터 수집 함수 (페이징 처리 완결판)
+# ---------------------------------------------------------
 get_fire_stats_all <- function(st_date, ed_date) {
-  message(">>> 산불 데이터 수집 시작 (작은 단위로 요청 중)...")
-  # numOfRows를 1000개씩 요청
-  q <- list(ServiceKey = API_KEY, searchStDt = st_date, searchEdDt = ed_date, 
-            numOfRows = 1000, `_type` = "xml")
-  txt <- api_get_text(FIRE_URL, q)
-  parsed <- parse_openapi_items_safe(txt)
+  message(">>> [Phase 1] 전체 데이터 건수 확인 중...")
   
-  if (parsed$ok) {
-    message(paste("성공: ", nrow(parsed$data), "건의 산불 데이터를 가져왔습니다."))
-    return(parsed$data)
-  } else {
-    stop(paste("산불 데이터 수집 실패:", parsed$meta$resultMsg))
+  # 1. 우선 1건만 요청해서 전체 개수(totalCount) 파악
+  init_q <- list(ServiceKey = API_KEY, searchStDt = st_date, searchEdDt = ed_date, 
+                 numOfRows = 1, pageNo = 1, `_type` = "xml")
+  init_txt <- api_get_text(FIRE_URL, init_q)
+  init_parsed <- parse_openapi_items_safe(init_txt)
+  
+  if (!init_parsed$ok) stop("초기 연결 실패: ", init_parsed$meta$resultMsg)
+  
+  total_cnt <- init_parsed$meta$totalCount
+  rows_per_page <- 1000
+  total_pages <- ceiling(total_cnt / rows_per_page) # 총 페이지 수 계산
+  
+  message(paste(">>> 총", total_cnt, "건 발견 (약", total_pages, "회 추가 호출 필요)"))
+  
+  # 2. 모든 페이지를 순회하며 데이터 수집
+  all_data <- tibble()
+  
+  for (p in 1:total_pages) {
+    message(paste(">>> 산불 데이터 수집 중... (", p, "/", total_pages, "페이지)"))
+    
+    q <- list(ServiceKey = API_KEY, searchStDt = st_date, searchEdDt = ed_date, 
+              numOfRows = rows_per_page, pageNo = p, `_type` = "xml")
+    
+    txt <- api_get_text(FIRE_URL, q)
+    parsed <- parse_openapi_items_safe(txt)
+    
+    if (parsed$ok) {
+      all_data <- bind_rows(all_data, parsed$data)
+    } else {
+      message(paste("!!! ", p, "페이지 수집 실패. 건너뜁니다."))
+    }
+    
+    Sys.sleep(0.2) # API 서버 매너 타임
   }
+  
+  return(all_data)
 }
 
 # 4. [B] 산림 기상(MTW) 데이터 수집 함수 (일별 반복 및 캐시 기능)
