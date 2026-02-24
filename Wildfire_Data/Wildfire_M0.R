@@ -122,5 +122,5 @@ print(m0_final_perf)
 print(auc_res) # M0 occ_AUC
 
 # M1과의 비교를 위해 객체 저장
-saveRDS(m0_final_perf, "Wildfire_Data/figures/m0_final_perf.rds")
+saveRDS(m0_final_perf, "Wildfire_Data/results/m0_final_perf.rds")
 
