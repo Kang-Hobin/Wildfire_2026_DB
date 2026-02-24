@@ -1,24 +1,44 @@
 ## =========================================================
-## Wildfire_res_summary.R
+## Wildfire_res_summary.R  (Fixed: explicit 3-file version)
 ##
 ## 목적:
-##  - Wildfire_Data/results/에 저장된 결과표 3종(M0/M1/M2)을 자동 로드
-##  - 공통 컬럼로 정리 후 한 눈에 비교 가능한 요약 테이블 생성
-##  - (특히) M2 STAR 결과는 RAW vs CAL을 wide 형식으로 요약
+##  - 결과 RDS 3개(M0, M1, M2)를 명시적으로 로드 (자동 탐색 X)
+##  - 공통 컬럼 정규화 후 통합 비교표 생성
+##  - M2(STAR)는 RAW/CAL 비교표(wide)까지 생성
+##  - family별 topline 1개(의도 반영) 생성
+##
+## 입력(수정해서 사용):
+##  - PATH_M0: benchmark 결과 (예: m0_final_perf.rds)
+##  - PATH_M1: SAR 2-part 결과 (예: m1_sar_2part_perf_2025.rds)
+##  - PATH_M2: STAR 5-model 결과 (예: m2_star_5models_perf_final.rds)
 ##
 ## 출력:
-##  - 콘솔: 통합표 / M2 RAW-CAL 요약 / 베스트 모델 요약
-##  - 파일(옵션): Wildfire_Data/results/res_summary_all.csv
+##  - Wildfire_Data/results/res_summary_all.csv
+##  - Wildfire_Data/results/res_summary_m2_raw_cal.csv (가능할 때)
+##  - Wildfire_Data/results/res_summary_topline.csv
 ## =========================================================
 
 suppressPackageStartupMessages({
   library(dplyr)
-  library(readr)
   library(tidyr)
+  library(readr)
   library(stringr)
 })
 
 RESULT_DIR <- "Wildfire_Data/results"
+
+# ---------------------------------------------------------
+# 0) USER: set your 3 result files here
+# ---------------------------------------------------------
+PATH_M0 <- file.path(RESULT_DIR, "m0_final_perf.rds")
+
+# 아래는 예시. 너의 실제 저장 파일명으로 맞춰줘.
+# (이전 대화 기준으로는 sar2part_vs_ols2part_perf_2025.rds가 있었는데,
+#  지금은 SAR만 저장한다고 했으니 새 파일명으로 바꾸는 걸 추천)
+PATH_M1 <- file.path(RESULT_DIR, "m1_sar_perf.rds")
+
+PATH_M2 <- file.path(RESULT_DIR, "m2_star_5models_perf_final.rds")
+
 OUT_CSV_ALL <- file.path(RESULT_DIR, "res_summary_all.csv")
 OUT_CSV_M2  <- file.path(RESULT_DIR, "res_summary_m2_raw_cal.csv")
 OUT_CSV_TOP <- file.path(RESULT_DIR, "res_summary_topline.csv")
@@ -26,33 +46,19 @@ OUT_CSV_TOP <- file.path(RESULT_DIR, "res_summary_topline.csv")
 msg <- function(...) message(sprintf(...))
 
 # ---------------------------------------------------------
-# 0) helpers
+# helpers
 # ---------------------------------------------------------
-safe_read_rds <- function(path) {
-  tryCatch(readRDS(path), error = function(e) NULL)
-}
-
-as_tibble_safe <- function(x) {
-  if (is.null(x)) return(NULL)
-  if (inherits(x, "data.frame")) return(as_tibble(x))
-  # sometimes objects are lists with a data.frame inside
-  if (is.list(x)) {
-    for (nm in names(x)) {
-      if (inherits(x[[nm]], "data.frame")) return(as_tibble(x[[nm]]))
-    }
-  }
-  NULL
+safe_read_tbl <- function(path) {
+  if (!file.exists(path)) stop("File not found: ", path)
+  obj <- readRDS(path)
+  if (!inherits(obj, "data.frame")) stop("RDS is not a data.frame/tibble: ", path)
+  as_tibble(obj)
 }
 
 normalize_cols <- function(df) {
-  # normalize common column names across scripts
-  # expected candidates:
-  # model / model_type / model_type.x
-  # AUC_occ / AUC / auc
-  # Calib / Calib_Ratio
   df <- as_tibble(df)
   
-  # model column
+  # model name
   if (!"model" %in% names(df)) {
     if ("model_type" %in% names(df)) df <- df %>% rename(model = model_type)
   }
@@ -63,184 +69,119 @@ normalize_cols <- function(df) {
     if ("auc" %in% names(df)) df <- df %>% rename(AUC_occ = auc)
   }
   
-  # Calib column
+  # calibration column
   if (!"Calib" %in% names(df)) {
     if ("Calib_Ratio" %in% names(df)) df <- df %>% rename(Calib = Calib_Ratio)
   }
   
-  # keep only columns we care about if present
   keep <- intersect(
     c("model","AUC_occ","RMSE","MAE","MedAE","Spearman","Calib","version","calib_factor"),
     names(df)
   )
-  df <- df %>% dplyr::select(all_of(keep))
   
-  df
-}
-
-infer_family <- function(path, df) {
-  fn <- basename(path)
-  
-  # rough family tagging
-  family <- case_when(
-    str_detect(fn, regex("^m0_|m0", ignore_case = TRUE)) ~ "M0 (Benchmark)",
-    str_detect(fn, regex("^m1_|sar2part|m1", ignore_case = TRUE)) ~ "M1 (SAR 2-part)",
-    str_detect(fn, regex("^m2_|star|5models", ignore_case = TRUE)) ~ "M2 (STAR)",
-    TRUE ~ "Other"
-  )
-  
-  # if model names include RAW/CAL, mark as M2 star-ish
-  if ("model" %in% names(df) && any(str_detect(df$model, "\\[CAL\\]|\\[RAW\\]"))) {
-    family <- "M2 (STAR)"
-  }
-  
-  family
+  df %>% dplyr::select(all_of(keep))
 }
 
 strip_suffix <- function(x) gsub("\\s*\\[(RAW|CAL)\\]\\s*$", "", x)
 
-# ---------------------------------------------------------
-# 1) auto-discover candidate rds files
-# ---------------------------------------------------------
-msg(">>> Scanning result directory: %s", RESULT_DIR)
-rds_files <- list.files(RESULT_DIR, pattern = "\\.rds$", full.names = TRUE)
-
-# prefer likely files but keep all
-candidates <- rds_files[str_detect(basename(rds_files),
-                                   regex("m0|m1|m2|sar2part|star|perf", ignore_case=TRUE))]
-if (length(candidates) == 0) {
-  stop("No candidate .rds files found under: ", RESULT_DIR)
-}
-
-msg(">>> Found %d candidate RDS files.", length(candidates))
-print(basename(candidates))
-
-# ---------------------------------------------------------
-# 2) read + normalize + bind
-# ---------------------------------------------------------
-all_tbls <- list()
-
-for (p in candidates) {
-  obj <- safe_read_rds(p)
-  df  <- as_tibble_safe(obj)
-  if (is.null(df)) next
-  
-  df <- normalize_cols(df)
-  fam <- infer_family(p, df)
-  
-  df <- df %>%
+add_family <- function(df, family, source_file) {
+  df %>%
     mutate(
-      source_file = basename(p),
-      family = fam
+      family = family,
+      source_file = source_file
     )
-  
-  all_tbls[[length(all_tbls) + 1]] <- df
 }
 
-if (length(all_tbls) == 0) stop("No readable data.frame/tibble found in candidate RDS files.")
+infer_version <- function(df) {
+  df %>%
+    mutate(
+      version = case_when(
+        !is.na(version) ~ version,
+        str_detect(model, "\\[CAL\\]$") ~ "CAL",
+        str_detect(model, "\\[RAW\\]$") ~ "RAW",
+        TRUE ~ NA_character_
+      )
+    )
+}
 
-res_all <- bind_rows(all_tbls)
+# ---------------------------------------------------------
+# 1) load 3 tables
+# ---------------------------------------------------------
+msg(">>> Loading 3 result tables...")
 
-msg(">>> Combined rows: %d", nrow(res_all))
+m0 <- safe_read_tbl(PATH_M0) %>% normalize_cols() %>% add_family("M0 (Benchmark)", basename(PATH_M0))
+m1 <- safe_read_tbl(PATH_M1) %>% normalize_cols() %>% add_family("M1 (SAR 2-part)", basename(PATH_M1))
+m2 <- safe_read_tbl(PATH_M2) %>% normalize_cols() %>% add_family("M2 (STAR)", basename(PATH_M2))
+
+res_all <- bind_rows(m0, m1, m2) %>% infer_version()
+
+msg(">>> Combined table:")
 print(res_all)
 
-# save combined csv
 write.csv(res_all, OUT_CSV_ALL, row.names = FALSE)
-msg("Saved combined table: %s", OUT_CSV_ALL)
+msg("Saved: %s", OUT_CSV_ALL)
 
 # ---------------------------------------------------------
-# 3) M2 STAR: RAW vs CAL wide summary (if exists)
+# 2) M2 RAW vs CAL wide summary (if present)
 # ---------------------------------------------------------
-res_m2 <- res_all %>% filter(family == "M2 (STAR)")
+m2_only <- res_all %>% filter(family == "M2 (STAR)")
 
-if (nrow(res_m2) > 0 && any(str_detect(res_m2$model, "\\[(RAW|CAL)\\]"))) {
-  res_m2_wide <- res_m2 %>%
-    mutate(
-      version = ifelse(!is.na(version), version,
-                       ifelse(str_detect(model, "\\[CAL\\]$"), "CAL", "RAW")),
-      model_base = strip_suffix(model)
-    ) %>%
-    dplyr::select(model_base, version, AUC_occ, RMSE, MAE, MedAE, Spearman, Calib, calib_factor, source_file) %>%
-    distinct() %>%
-    pivot_wider(
-      names_from = version,
-      values_from = c(RMSE, MAE, MedAE, Spearman, Calib, calib_factor),
-      names_glue = "{.value}_{version}"
-    ) %>%
-    arrange(desc(Spearman_RAW))
-  
-  msg(">>> [M2] RAW vs CAL summary (wide):")
-  print(res_m2_wide)
-  
-  write.csv(res_m2_wide, OUT_CSV_M2, row.names = FALSE)
-  msg("Saved M2 RAW/CAL summary: %s", OUT_CSV_M2)
+if (nrow(m2_only) > 0 && any(m2_only$version %in% c("RAW","CAL"))) {
+  # prefer making wide only when both exist
+  if (all(c("RAW","CAL") %in% unique(na.omit(m2_only$version)))) {
+    m2_wide <- m2_only %>%
+      mutate(model_base = strip_suffix(model)) %>%
+      dplyr::select(model_base, version, AUC_occ, RMSE, MAE, MedAE, Spearman, Calib, calib_factor) %>%
+      distinct() %>%
+      pivot_wider(
+        names_from = version,
+        values_from = c(RMSE, MAE, MedAE, Spearman, Calib, calib_factor),
+        names_glue = "{.value}_{version}"
+      ) %>%
+      arrange(desc(Spearman_RAW))
+    
+    msg(">>> M2 RAW vs CAL (wide):")
+    print(m2_wide)
+    
+    write.csv(m2_wide, OUT_CSV_M2, row.names = FALSE)
+    msg("Saved: %s", OUT_CSV_M2)
+  } else {
+    msg(">>> M2 wide summary skipped: RAW and CAL not both present.")
+  }
 } else {
-  msg(">>> [M2] RAW/CAL rows not detected. Skipping wide summary.")
+  msg(">>> M2 not found or no version labels present.")
 }
 
 # ---------------------------------------------------------
-# 4) Topline: 1 best per family (with sensible preference rules)
-#   - M2: prefer CAL if exists, else RAW
-#   - M1: prefer SAR models (name contains "SAR")
-#   - Exclude obviously broken/old outputs if needed
+# 3) Topline: 1 row per family (rules)
+#   - M2: prefer CAL if exists else RAW else max Spearman
+#   - M1: choose max Spearman (assumes file already SAR-only)
+#   - M0: choose max Spearman
 # ---------------------------------------------------------
-
-strip_suffix <- function(x) gsub("\\s*\\[(RAW|CAL)\\]\\s*$", "", x)
-
-res_all2 <- res_all %>%
-  mutate(
-    version2 = case_when(
-      !is.na(version) ~ version,
-      str_detect(model, "\\[CAL\\]$") ~ "CAL",
-      str_detect(model, "\\[RAW\\]$") ~ "RAW",
-      TRUE ~ NA_character_
-    ),
-    model_base = strip_suffix(model)
-  ) %>%
-  # (선택) 구버전/이상치 파일 걸러내기: 파일명에 "perf"만 있고 final이 아닌 등
-  # 필요하면 아래 조건을 더 빡세게 바꿔도 됨
-  filter(!str_detect(source_file, regex("m2_star_perf", ignore_case = TRUE))) %>%
-  # Calib이 음수거나 Spearman이 극단적으로 이상한 경우는 보통 계산/정의 오류였던 산출물
-  filter(is.na(Spearman) | Spearman > -0.5)
-
-# ---- M2: CAL 우선, 없으면 RAW ----
-m2_pref <- res_all2 %>% 
-  filter(family == "M2 (STAR)") %>%
-  {
-    if (any(.$version2 == "CAL", na.rm = TRUE)) filter(., version2 == "CAL")
-    else if (any(.$version2 == "RAW", na.rm = TRUE)) filter(., version2 == "RAW")
-    else .
-  } %>%
+top_m0 <- res_all %>% filter(family == "M0 (Benchmark)") %>%
   slice_max(order_by = Spearman, n = 1, with_ties = FALSE)
 
-# ---- M1: SAR 포함 모델 우선 ----
-m1_pref <- res_all2 %>%
-  filter(family == "M1 (SAR 2-part)") %>%
-  {
-    if (any(str_detect(.$model, regex("SAR", ignore_case = TRUE)))) {
-      filter(., str_detect(model, regex("SAR", ignore_case = TRUE)))
-    } else .
-  } %>%
+top_m1 <- res_all %>% filter(family == "M1 (SAR 2-part)") %>%
   slice_max(order_by = Spearman, n = 1, with_ties = FALSE)
 
-# ---- M0: 그냥 Spearman 최고 ----
-m0_pref <- res_all2 %>%
-  filter(family == "M0 (Benchmark)") %>%
-  slice_max(order_by = Spearman, n = 1, with_ties = FALSE)
+m2_pool <- res_all %>% filter(family == "M2 (STAR)")
+top_m2 <- m2_pool
+if (nrow(m2_pool) > 0) {
+  if (any(m2_pool$version == "CAL", na.rm = TRUE)) {
+    top_m2 <- m2_pool %>% filter(version == "CAL")
+  } else if (any(m2_pool$version == "RAW", na.rm = TRUE)) {
+    top_m2 <- m2_pool %>% filter(version == "RAW")
+  }
+  top_m2 <- top_m2 %>% slice_max(order_by = Spearman, n = 1, with_ties = FALSE)
+}
 
-# ---- Other families (if any) ----
-other_pref <- res_all2 %>%
-  filter(!family %in% c("M0 (Benchmark)", "M1 (SAR 2-part)", "M2 (STAR)")) %>%
-  group_by(family) %>%
-  slice_max(order_by = Spearman, n = 1, with_ties = FALSE) %>%
-  ungroup()
-
-topline <- bind_rows(m0_pref, m1_pref, m2_pref, other_pref) %>%
-  dplyr::select(-model_base) %>%
+topline <- bind_rows(top_m0, top_m1, top_m2) %>%
   arrange(family)
 
-msg(">>> Topline (preferred rules applied):")
+msg(">>> Topline (1 per family):")
 print(topline)
 
 write.csv(topline, OUT_CSV_TOP, row.names = FALSE)
-msg("Saved topline: %s", OUT_CSV_TOP)
+msg("Saved: %s", OUT_CSV_TOP)
+
+msg(">>> Done.")
