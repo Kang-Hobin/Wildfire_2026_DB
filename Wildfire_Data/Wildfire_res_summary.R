@@ -1,187 +1,135 @@
-## =========================================================
-## Wildfire_res_summary.R  (Fixed: explicit 3-file version)
-##
-## 목적:
-##  - 결과 RDS 3개(M0, M1, M2)를 명시적으로 로드 (자동 탐색 X)
-##  - 공통 컬럼 정규화 후 통합 비교표 생성
-##  - M2(STAR)는 RAW/CAL 비교표(wide)까지 생성
-##  - family별 topline 1개(의도 반영) 생성
-##
-## 입력(수정해서 사용):
-##  - PATH_M0: benchmark 결과 (예: m0_final_perf.rds)
-##  - PATH_M1: SAR 2-part 결과 (예: m1_sar_2part_perf_2025.rds)
-##  - PATH_M2: STAR 5-model 결과 (예: m2_star_5models_perf_final.rds)
-##
-## 출력:
-##  - Wildfire_Data/results/res_summary_all.csv
-##  - Wildfire_Data/results/res_summary_m2_raw_cal.csv (가능할 때)
-##  - Wildfire_Data/results/res_summary_topline.csv
-## =========================================================
+# =========================================================
+# Wildfire_Final_Compare_Table.R
+# - Load M0/M1/M2 performance RDS
+# - Harmonize columns to the standard metric set
+# - Create final comparison table + rankings
+# - Save combined RDS/CSV
+# =========================================================
 
 suppressPackageStartupMessages({
   library(dplyr)
-  library(tidyr)
   library(readr)
+  library(tidyr)
   library(stringr)
 })
 
-RESULT_DIR <- "Wildfire_Data/results"
+# ---------------------------------------------------------
+# 0) Paths
+# ---------------------------------------------------------
+IN_M0 <- "Wildfire_Data/results/m0_final_perf.rds"
+IN_M1 <- "Wildfire_Data/results/m1_sar_perf.rds"
+IN_M2 <- "Wildfire_Data/results/m2_star_5models_perf_final.rds"
+
+OUT_DIR <- "Wildfire_Data/results"
+if (!dir.exists(OUT_DIR)) dir.create(OUT_DIR, recursive = TRUE)
+
+OUT_RDS <- file.path(OUT_DIR, "final_perf_all_models.rds")
+OUT_CSV <- file.path(OUT_DIR, "final_perf_all_models.csv")
+
+OUT_RANK_CSV <- file.path(OUT_DIR, "final_perf_all_models_ranked.csv")
+
+# Standard metric columns (must match M0/M1/M2)
+STD_COLS <- c(
+  "model_type",
+  "AUC_occ",
+  "RMSE",
+  "MAE",
+  "MedianAE",
+  "RMSLE",
+  "Spearman",
+  "BR_rate_down",
+  "BR_rate_up",
+  "BR_sev_down",
+  "BR_sev_up"
+)
 
 # ---------------------------------------------------------
-# 0) USER: set your 3 result files here
+# 1) Coerce helper
 # ---------------------------------------------------------
-PATH_M0 <- file.path(RESULT_DIR, "m0_final_perf.rds")
-
-# 아래는 예시. 너의 실제 저장 파일명으로 맞춰줘.
-# (이전 대화 기준으로는 sar2part_vs_ols2part_perf_2025.rds가 있었는데,
-#  지금은 SAR만 저장한다고 했으니 새 파일명으로 바꾸는 걸 추천)
-PATH_M1 <- file.path(RESULT_DIR, "m1_sar_perf.rds")
-
-PATH_M2 <- file.path(RESULT_DIR, "m2_star_5models_perf_final.rds")
-
-OUT_CSV_ALL <- file.path(RESULT_DIR, "res_summary_all.csv")
-OUT_CSV_M2  <- file.path(RESULT_DIR, "res_summary_m2_raw_cal.csv")
-OUT_CSV_TOP <- file.path(RESULT_DIR, "res_summary_topline.csv")
-
-msg <- function(...) message(sprintf(...))
-
-# ---------------------------------------------------------
-# helpers
-# ---------------------------------------------------------
-safe_read_tbl <- function(path) {
-  if (!file.exists(path)) stop("File not found: ", path)
-  obj <- readRDS(path)
-  if (!inherits(obj, "data.frame")) stop("RDS is not a data.frame/tibble: ", path)
-  as_tibble(obj)
+coerce_perf <- function(x) {
+  x <- as.data.frame(x)
+  
+  # Legacy name fixes
+  if ("model" %in% names(x) && !"model_type" %in% names(x)) {
+    x$model_type <- x$model
+    x$model <- NULL
+  }
+  if ("MedAE" %in% names(x) && !"MedianAE" %in% names(x)) {
+    x$MedianAE <- x$MedAE
+    x$MedAE <- NULL
+  }
+  
+  # If any missing standard cols, create as NA
+  missing <- setdiff(STD_COLS, names(x))
+  for (cn in missing) x[[cn]] <- NA_real_
+  
+  # Keep only standard cols in order
+  x <- x[, STD_COLS, drop = FALSE]
+  
+  # Coerce numeric cols
+  num_cols <- setdiff(STD_COLS, "model_type")
+  for (cn in num_cols) x[[cn]] <- as.numeric(x[[cn]])
+  
+  as_tibble(x)
 }
 
-normalize_cols <- function(df) {
-  df <- as_tibble(df)
-  
-  # model name
-  if (!"model" %in% names(df)) {
-    if ("model_type" %in% names(df)) df <- df %>% rename(model = model_type)
-  }
-  
-  # AUC column
-  if (!"AUC_occ" %in% names(df)) {
-    if ("AUC" %in% names(df)) df <- df %>% rename(AUC_occ = AUC)
-    if ("auc" %in% names(df)) df <- df %>% rename(AUC_occ = auc)
-  }
-  
-  # calibration column
-  if (!"Calib" %in% names(df)) {
-    if ("Calib_Ratio" %in% names(df)) df <- df %>% rename(Calib = Calib_Ratio)
-  }
-  
-  keep <- intersect(
-    c("model","AUC_occ","RMSE","MAE","MedAE","Spearman","Calib","version","calib_factor"),
-    names(df)
+# ---------------------------------------------------------
+# 2) Load & combine
+# ---------------------------------------------------------
+m0 <- coerce_perf(readRDS(IN_M0))
+m1 <- coerce_perf(readRDS(IN_M1))
+m2 <- coerce_perf(readRDS(IN_M2))
+
+final <- bind_rows(m0, m1, m2)
+
+# Optional: add group labels for readability (M0/M1/M2)
+final <- final %>%
+  mutate(
+    model_group = case_when(
+      str_detect(model_type, "^EP_") ~ "M0",
+      str_detect(model_type, "^M1_") ~ "M1",
+      str_detect(model_type, "^M[1-5]:") ~ "M2",
+      TRUE ~ "Other"
+    )
   )
-  
-  df %>% dplyr::select(all_of(keep))
-}
 
-strip_suffix <- function(x) gsub("\\s*\\[(RAW|CAL)\\]\\s*$", "", x)
+# Show final table
+print(final)
 
-add_family <- function(df, family, source_file) {
-  df %>%
-    mutate(
-      family = family,
-      source_file = source_file
-    )
-}
+# Save combined
+saveRDS(final, OUT_RDS)
+readr::write_csv(final, OUT_CSV)
 
-infer_version <- function(df) {
-  df %>%
-    mutate(
-      version = case_when(
-        !is.na(version) ~ version,
-        str_detect(model, "\\[CAL\\]$") ~ "CAL",
-        str_detect(model, "\\[RAW\\]$") ~ "RAW",
-        TRUE ~ NA_character_
-      )
-    )
-}
+message(sprintf("Saved combined RDS: %s", OUT_RDS))
+message(sprintf("Saved combined CSV: %s", OUT_CSV))
 
 # ---------------------------------------------------------
-# 1) load 3 tables
+# 3) Ranking table (for quick final comparison)
+#    - Lower is better: RMSE, MAE, MedianAE, RMSLE, BR_* (all)
+#    - Higher is better: AUC_occ, Spearman
 # ---------------------------------------------------------
-msg(">>> Loading 3 result tables...")
+ranked <- final %>%
+  mutate(
+    rank_AUC      = dense_rank(desc(AUC_occ)),
+    rank_Spear    = dense_rank(desc(Spearman)),
+    rank_RMSE     = dense_rank(RMSE),
+    rank_MAE      = dense_rank(MAE),
+    rank_MedianAE = dense_rank(MedianAE),
+    rank_RMSLE    = dense_rank(RMSLE),
+    rank_BRrd     = dense_rank(BR_rate_down),
+    rank_BRru     = dense_rank(BR_rate_up),
+    rank_BRsd     = dense_rank(BR_sev_down),
+    rank_BRsu     = dense_rank(BR_sev_up)
+  ) %>%
+  # Simple composite (equal weights): lower is better
+  mutate(
+    rank_total = rank_AUC + rank_Spear +
+      rank_RMSE + rank_MAE + rank_MedianAE + rank_RMSLE +
+      rank_BRrd + rank_BRru + rank_BRsd + rank_BRsu
+  ) %>%
+  arrange(rank_total, RMSE, MAE)
 
-m0 <- safe_read_tbl(PATH_M0) %>% normalize_cols() %>% add_family("M0 (Benchmark)", basename(PATH_M0))
-m1 <- safe_read_tbl(PATH_M1) %>% normalize_cols() %>% add_family("M1 (SAR 2-part)", basename(PATH_M1))
-m2 <- safe_read_tbl(PATH_M2) %>% normalize_cols() %>% add_family("M2 (STAR)", basename(PATH_M2))
+print(ranked %>% dplyr::select(model_group, model_type, rank_total, everything()))
 
-res_all <- bind_rows(m0, m1, m2) %>% infer_version()
-
-msg(">>> Combined table:")
-print(res_all)
-
-write.csv(res_all, OUT_CSV_ALL, row.names = FALSE)
-msg("Saved: %s", OUT_CSV_ALL)
-
-# ---------------------------------------------------------
-# 2) M2 RAW vs CAL wide summary (if present)
-# ---------------------------------------------------------
-m2_only <- res_all %>% filter(family == "M2 (STAR)")
-
-if (nrow(m2_only) > 0 && any(m2_only$version %in% c("RAW","CAL"))) {
-  # prefer making wide only when both exist
-  if (all(c("RAW","CAL") %in% unique(na.omit(m2_only$version)))) {
-    m2_wide <- m2_only %>%
-      mutate(model_base = strip_suffix(model)) %>%
-      dplyr::select(model_base, version, AUC_occ, RMSE, MAE, MedAE, Spearman, Calib, calib_factor) %>%
-      distinct() %>%
-      pivot_wider(
-        names_from = version,
-        values_from = c(RMSE, MAE, MedAE, Spearman, Calib, calib_factor),
-        names_glue = "{.value}_{version}"
-      ) %>%
-      arrange(desc(Spearman_RAW))
-    
-    msg(">>> M2 RAW vs CAL (wide):")
-    print(m2_wide)
-    
-    write.csv(m2_wide, OUT_CSV_M2, row.names = FALSE)
-    msg("Saved: %s", OUT_CSV_M2)
-  } else {
-    msg(">>> M2 wide summary skipped: RAW and CAL not both present.")
-  }
-} else {
-  msg(">>> M2 not found or no version labels present.")
-}
-
-# ---------------------------------------------------------
-# 3) Topline: 1 row per family (rules)
-#   - M2: prefer CAL if exists else RAW else max Spearman
-#   - M1: choose max Spearman (assumes file already SAR-only)
-#   - M0: choose max Spearman
-# ---------------------------------------------------------
-top_m0 <- res_all %>% filter(family == "M0 (Benchmark)") %>%
-  slice_max(order_by = Spearman, n = 1, with_ties = FALSE)
-
-top_m1 <- res_all %>% filter(family == "M1 (SAR 2-part)") %>%
-  slice_max(order_by = Spearman, n = 1, with_ties = FALSE)
-
-m2_pool <- res_all %>% filter(family == "M2 (STAR)")
-top_m2 <- m2_pool
-if (nrow(m2_pool) > 0) {
-  if (any(m2_pool$version == "CAL", na.rm = TRUE)) {
-    top_m2 <- m2_pool %>% filter(version == "CAL")
-  } else if (any(m2_pool$version == "RAW", na.rm = TRUE)) {
-    top_m2 <- m2_pool %>% filter(version == "RAW")
-  }
-  top_m2 <- top_m2 %>% slice_max(order_by = Spearman, n = 1, with_ties = FALSE)
-}
-
-topline <- bind_rows(top_m0, top_m1, top_m2) %>%
-  arrange(family)
-
-msg(">>> Topline (1 per family):")
-print(topline)
-
-write.csv(topline, OUT_CSV_TOP, row.names = FALSE)
-msg("Saved: %s", OUT_CSV_TOP)
-
-msg(">>> Done.")
+readr::write_csv(ranked, OUT_RANK_CSV)
+message(sprintf("Saved ranked CSV: %s", OUT_RANK_CSV))

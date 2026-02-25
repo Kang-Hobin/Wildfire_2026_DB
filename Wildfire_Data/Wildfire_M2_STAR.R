@@ -1,18 +1,19 @@
 ## =========================================================
-## Wildfire_M2_STAR_v2.R
+## Wildfire_M2_STAR_v2_occ5.R
 ##
-## 목적:
-##  (1) 시군구-연도 패널 균형화 + train 통계로 결측대체(누수 방지)
-##  (2) 빈도(N) STAR 계열 5개 모델(M1~M5) 적합
-##  (3) 심도(S: 건당 피해) SAR 모델 1개 적합
-##  (4) 2025 OOT 예측: EP = N_hat * Sev_hat
-##  (5) 성능지표 저장
+## Purpose:
+##  - Keep original M2 (Freq×Sev) code intact; this is an alternative M2' pipeline
+##  - Build Occurrence-based 2-part model under the SAME 5 model family (M1~M5)
+##    Part1: Occurrence probability P_hat via 5 models (ST/STAR variants)
+##    Part2: Conditional positive total loss L^+ via STAR pooled SAR on log1p(loss)
+##  - 2025 OOT: EP = P_hat * Lhat_pos
+##  - Metrics + optional train-only calibration
 ##
-## 핵심 안정성:
-##  - islands / disjoint subgraphs: component-wise solve + fallback(power series)
-##  - AUC_occ는 EP가 아니라 N_hat로 계산 (정의 정상화)
-##  - 역변환 bias correction: Duan smearing(모델별 잔차 기반) 사용
-##    (분산보정 exp(mu+s2/2)은 객체/가정 불일치가 잦아 v2에선 배제)
+## Notes:
+##  - Part1 uses linear probability-style models; P_hat is clipped to [0,1]
+##  - Part2 uses Duan smearing for inverse log1p
+##  - AUC_occ uses P_hat (NOT EP)
+##  - Islands/disjoint graphs: component-wise solve + fallback(power series)
 ## =========================================================
 
 suppressPackageStartupMessages({
@@ -35,8 +36,8 @@ PATH_W     <- "Wildfire_Data/meta_data/sgg_spatial_weights_252.rds"
 OUT_DIR <- "Wildfire_Data/results"
 if (!dir.exists(OUT_DIR)) dir.create(OUT_DIR, recursive = TRUE)
 
-OUT_RDS <- file.path(OUT_DIR, "m2_star_5models_perf_final.rds")
-OUT_CSV <- file.path(OUT_DIR, "m2_star_5models_perf_final.csv")
+OUT_RDS <- file.path(OUT_DIR, "m2_occ5_perf_final.rds")
+OUT_CSV <- file.path(OUT_DIR, "m2_occ5_perf_final.csv")
 
 TEST_YEAR <- 2025
 PS_FALLBACK_ORDER <- 20
@@ -67,6 +68,23 @@ build_W <- function(W_dense, region_ids) {
 build_block_listw <- function(W_rs, T_train, zero_policy = TRUE) {
   W_block <- Matrix::kronecker(Matrix::Diagonal(T_train), W_rs)
   spdep::mat2listw(as.matrix(W_block), style="W", zero.policy = zero_policy)
+}
+
+# Panel-safe helper: apply single-year W within each year slice
+apply_W_by_year <- function(x, year_vec, W_rs) {
+  year_vec <- as.integer(year_vec)
+  out <- numeric(length(x))
+  yrs <- unique(year_vec)
+  
+  for (yy in yrs) {
+    idx <- which(year_vec == yy)
+    if (length(idx) != nrow(W_rs)) {
+      stop(sprintf("apply_W_by_year: year=%s has %d rows, expected %d (check balancing/sorting).",
+                   yy, length(idx), nrow(W_rs)))
+    }
+    out[idx] <- as.numeric(W_rs %*% as.numeric(x[idx]))
+  }
+  out
 }
 
 # ---------------------------------------------------------
@@ -119,7 +137,6 @@ scale_with_train <- function(train_df, test_df, cols) {
 
 # ---------------------------------------------------------
 # 3) Component-wise safe spatial filter: y = (I - rho W)^(-1) xb
-#    (islands + disjoint subgraphs safe)
 # ---------------------------------------------------------
 get_components_from_W <- function(W) {
   A <- (W != 0) | (Matrix::t(W) != 0)
@@ -206,9 +223,6 @@ spatial_filter_safe <- function(xb, W, rho, ps_order = 20) {
 
 # ---------------------------------------------------------
 # 4) Robust prediction for lm / sarlm (lagsarlm)
-#    - build xb by matching coefficient names to newdata columns
-#    - Durbin lag.X terms auto-generated: "lag.var" = W %*% var
-#    - spatial reduced form applied using single-year W_rs (consistent for OOT year)
 # ---------------------------------------------------------
 get_spatial_param <- function(fit) {
   if (!is.null(fit$rho)) return(as.numeric(fit$rho))
@@ -239,12 +253,9 @@ ensure_lag_terms <- function(newdata, coef_names, W_matrix) {
     
     x <- as.numeric(newdata[[v]])
     
-    # Case 1) single-year slice: length matches W dimension
     if (length(x) == nrow(W_matrix)) {
       newdata[[lt]] <- as.numeric(W_matrix %*% x)
-      
     } else {
-      # Case 2) panel stacked: compute year-wise W * x_year
       if (!("year" %in% names(newdata))) {
         stop("ensure_lag_terms: panel-length detected but 'year' column not found.")
       }
@@ -273,7 +284,6 @@ predict_mu_star <- function(fit, newdata, W_matrix, ps_order = 20) {
   xb <- xb + as.numeric(X %*% b[vars])
   xb[!is.finite(xb)] <- 0
   
-  # If panel-stacked, apply reduced form within each year slice (block diagonal logic)
   if (length(xb) == nrow(W_matrix)) {
     return(spatial_filter_safe(xb, W_matrix, rho, ps_order = ps_order))
   } else {
@@ -300,58 +310,62 @@ smearing_factor <- function(fit) {
 }
 
 inv_log1p_smear <- function(mu_hat, smear) {
-  # E[Z] approx = smear * exp(mu_hat) - 1   (with Z = expm1(Y))
+  # inverse for log1p(Z): E[Z] approx = smear * exp(mu_hat) - 1
   pmax(smear * exp(mu_hat) - 1, 0)
 }
 
 # ---------------------------------------------------------
-# 5) Metrics (AUC uses N_hat, NOT EP)
+# 5) Metrics (AUC uses P_hat, NOT EP)
 # ---------------------------------------------------------
-evaluate_models <- function(actual_cnt, actual_loss, n_hat, ep_hat, model_name) {
-  actual_cnt <- as.numeric(actual_cnt)
-  actual_loss <- as.numeric(actual_loss)
+evaluate_models_occ <- function(actual_cnt, actual_loss, p_hat, ep_hat, model_name,
+                                tol = 1e-8, eps = 1e-8) {
+  actual_cnt  <- as.numeric(actual_cnt)
+  L <- pmax(as.numeric(actual_loss), 0)
   
   occ_actual <- as.numeric(actual_cnt > 0)
-  n_hat  <- pmax(as.numeric(n_hat), 0)
-  ep_hat <- pmax(as.numeric(ep_hat), 0)
   
-  # AUC uses N_hat (NOT EP)
+  p_hat <- pmin(pmax(as.numeric(p_hat), 0), 1)
+  P <- pmax(as.numeric(ep_hat), 0)
+  
   auc_val <- NA_real_
   if (length(unique(occ_actual)) >= 2) {
     auc_val <- tryCatch(
-      as.numeric(pROC::auc(pROC::roc(occ_actual, n_hat, quiet = TRUE))),
+      as.numeric(pROC::auc(pROC::roc(occ_actual, p_hat, quiet = TRUE))),
       error = function(e) NA_real_
     )
   }
   
-  rmse  <- sqrt(mean((actual_loss - ep_hat)^2, na.rm=TRUE))
-  mae   <- mean(abs(actual_loss - ep_hat), na.rm=TRUE)
-  medae <- median(abs(actual_loss - ep_hat), na.rm=TRUE)
+  rmse   <- sqrt(mean((L - P)^2, na.rm = TRUE))
+  mae    <- mean(abs(L - P), na.rm = TRUE)
+  medae  <- median(abs(L - P), na.rm = TRUE)
+  rmsle  <- sqrt(mean((log1p(L) - log1p(P))^2, na.rm = TRUE))
+  spear  <- suppressWarnings(cor(L, P, method = "spearman", use = "complete.obs"))
   
-  idx_inf <- which((actual_loss > 0) | (ep_hat > 0))
-  spearman <- NA_real_
-  if (length(idx_inf) >= 3) {
-    a <- actual_loss[idx_inf]
-    p <- ep_hat[idx_inf]
-    if (sd(a, na.rm=TRUE) > 0 && sd(p, na.rm=TRUE) > 0) {
-      spearman <- suppressWarnings(cor(a, p, method="spearman", use="complete.obs"))
-    } else {
-      spearman <- 0
-    }
-  }
+  P0 <- P <= tol
+  br_rate_down <- mean((L > 0) & P0, na.rm = TRUE)
+  br_rate_up   <- mean((L == 0) & (!P0), na.rm = TRUE)
   
-  calib <- sum(ep_hat, na.rm=TRUE) / sum(actual_loss, na.rm=TRUE)
+  br_sev_down <- sum(pmax(L - P, 0), na.rm = TRUE) / (sum(L, na.rm = TRUE) + eps)
+  br_sev_up   <- sum(pmax(P - L, 0), na.rm = TRUE) / (sum(P, na.rm = TRUE) + eps)
   
   tibble(
-    model = model_name,
-    AUC_occ = auc_val,
-    RMSE = rmse,
-    MAE = mae,
-    MedAE = medae,
-    Spearman = spearman,
-    Calib = calib,
-    Pred_ZeroShare = mean(ep_hat == 0, na.rm=TRUE)
+    model_type   = model_name,
+    AUC_occ      = auc_val,
+    RMSE         = rmse,
+    MAE          = mae,
+    MedianAE     = medae,
+    RMSLE        = rmsle,
+    Spearman     = spear,
+    BR_rate_down = br_rate_down,
+    BR_rate_up   = br_rate_up,
+    BR_sev_down  = br_sev_down,
+    BR_sev_up    = br_sev_up
   )
+}
+
+safe_factor <- function(sum_actual, sum_pred) {
+  if (!is.finite(sum_pred) || sum_pred <= 0) return(1.0)
+  as.numeric(sum_actual / sum_pred)
 }
 
 # ---------------------------------------------------------
@@ -381,9 +395,9 @@ panel <- make_balanced_template(df_all_raw, region_ids, years_all) %>%
     fire_cnt_year = tidyr::replace_na(fire_cnt_year, 0),
     damage_capped = tidyr::replace_na(damage_capped, 0),
     
-    # targets
-    y_freq = log1p(fire_cnt_year),
-    y_sev  = log1p(damage_capped / pmax(fire_cnt_year, 1))
+    # targets for 2-part
+    fire_any = as.numeric(fire_cnt_year > 0),
+    y_loss   = log1p(damage_capped)
   )
 
 train_mask <- panel$year < TEST_YEAR
@@ -397,16 +411,16 @@ panel <- panel %>%
   group_by(sigungu_cd) %>%
   arrange(year, .by_group = TRUE) %>%
   mutate(
-    y_freq_lag1 = lag(y_freq, 1),
-    y_sev_lag1  = lag(y_sev, 1)
+    fire_any_lag1 = lag(fire_any, 1),
+    y_loss_lag1   = lag(y_loss, 1)
   ) %>%
   ungroup() %>%
-  filter(!is.na(y_freq_lag1), !is.na(y_sev_lag1))
+  filter(!is.na(fire_any_lag1), !is.na(y_loss_lag1))
 
-# spatial lag Wy_freq_lag1 by year
+# spatial lag of occurrence-lag by year: Wy_fire_any_lag1
 panel <- panel %>%
   group_by(year) %>%
-  mutate(Wy_freq_lag1 = as.numeric(W_rs %*% y_freq_lag1)) %>%
+  mutate(Wy_fire_any_lag1 = as.numeric(W_rs %*% fire_any_lag1)) %>%
   ungroup()
 
 train_df <- panel %>% filter(year < TEST_YEAR) %>% arrange(year, sigungu_cd)
@@ -414,41 +428,42 @@ test_df  <- panel %>% filter(year == TEST_YEAR) %>% arrange(year, sigungu_cd)
 
 stopifnot(nrow(test_df) == length(region_ids))
 
-msg(">>> [3/7] Scaling for frequency models (train stats only)...")
-scale_cols <- c("y_freq_lag1", "Wy_freq_lag1", COVARS_LAG1)
+msg(">>> [3/7] Scaling for occurrence models (train stats only)...")
+# Occurrence is binary, but we scale lag terms/covars (same style as original M2)
+scale_cols <- c("fire_any_lag1", "Wy_fire_any_lag1", COVARS_LAG1)
 scaled <- scale_with_train(train_df, test_df, scale_cols)
 train_df <- scaled$train
 test_df  <- scaled$test
 
-msg(">>> [4/7] Fit Frequency models (M1~M5)...")
+msg(">>> [4/7] Fit Occurrence models (M1~M5, ST/STAR family)...")
 
-# M1: Mixed-ST (OLS)
+# M1: Mixed-ST (OLS) on fire_any
 f_m1 <- as.formula(paste(
-  "y_freq ~ y_freq_lag1 + Wy_freq_lag1 +",
+  "fire_any ~ fire_any_lag1 + Wy_fire_any_lag1 +",
   paste(COVARS_LAG1, collapse=" + ")
 ))
-m1_st <- lm(f_m1, data=train_df)
+m1_occ <- lm(f_m1, data=train_df)
 
-# M2: Pure-ST (OLS)
-m2_st <- lm(y_freq ~ y_freq_lag1 + Wy_freq_lag1, data=train_df)
+# M2: Pure-ST (OLS) on fire_any
+m2_occ <- lm(fire_any ~ fire_any_lag1 + Wy_fire_any_lag1, data=train_df)
 
 # STAR pooled SAR over years: block-diagonal W for training
 train_years <- sort(unique(train_df$year))
 T_train <- length(train_years)
 W_time_train <- build_block_listw(W_rs, T_train, zero_policy = TRUE)
 
-# M3: Pure-STAR (SAR)
-m3_star <- spatialreg::lagsarlm(
-  y_freq ~ y_freq_lag1,
+# M3: Pure-STAR (SAR) on fire_any
+m3_occ <- spatialreg::lagsarlm(
+  fire_any ~ fire_any_lag1,
   data = train_df,
   listw = W_time_train,
   method = "LU",
   zero.policy = TRUE
 )
 
-# M4: Mixed-STAR (SAR + X)
-f_m4 <- as.formula(paste("y_freq ~ y_freq_lag1 +", paste(COVARS_LAG1, collapse=" + ")))
-m4_star <- spatialreg::lagsarlm(
+# M4: Mixed-STAR (SAR + X) on fire_any
+f_m4 <- as.formula(paste("fire_any ~ fire_any_lag1 +", paste(COVARS_LAG1, collapse=" + ")))
+m4_occ <- spatialreg::lagsarlm(
   f_m4,
   data = train_df,
   listw = W_time_train,
@@ -456,8 +471,8 @@ m4_star <- spatialreg::lagsarlm(
   zero.policy = TRUE
 )
 
-# M5: Res-STAR (SDM/Durbin)
-m5_star <- spatialreg::lagsarlm(
+# M5: Res-STAR (SDM/Durbin) on fire_any
+m5_occ <- spatialreg::lagsarlm(
   f_m4,
   data = train_df,
   listw = W_time_train,
@@ -466,174 +481,132 @@ m5_star <- spatialreg::lagsarlm(
   Durbin = as.formula(paste("~", paste(COVARS_LAG1, collapse=" + ")))
 )
 
-msg(">>> [5/7] Fit Severity model (SAR on y_sev)...")
-# Severity pooled SAR over years (same block W idea)
-f_sev <- as.formula(paste("y_sev ~ y_sev_lag1 +", paste(COVARS_LAG1, collapse=" + ")))
-sev_star <- spatialreg::lagsarlm(
-  f_sev,
+msg(">>> [5/7] Fit Conditional Loss model (STAR pooled SAR on y_loss)...")
+# Part 2: log1p(total loss) with lag + fire_any + covars
+f_loss <- as.formula(paste("y_loss ~ y_loss_lag1 + fire_any +", paste(COVARS_LAG1, collapse=" + ")))
+m_loss <- spatialreg::lagsarlm(
+  f_loss,
   data = train_df,
   listw = W_time_train,
   method = "LU",
   zero.policy = TRUE
 )
 
-# Smearing factors (model-specific)
-smear_m1 <- smearing_factor(m1_st)
-smear_m2 <- smearing_factor(m2_st)
-smear_m3 <- smearing_factor(m3_star)
-smear_m4 <- smearing_factor(m4_star)
-smear_m5 <- smearing_factor(m5_star)
-smear_sev <- smearing_factor(sev_star)
+smear_loss <- smearing_factor(m_loss)
 
 msg(">>> [6a/7] Learn calibration factors from TRAIN (no leakage)...")
+# Train: conditional positive loss prediction (set fire_any=1)
+train_loss_nd <- train_df
+train_loss_nd$fire_any <- 1
 
-## Addon : Calibration Adjustment ---
-# Panel-safe helper: apply single-year W within each year slice
-# Assumes newdata is sorted by (year, sigungu_cd) OR at least grouped contiguous by year.
-apply_W_by_year <- function(x, year_vec, W_rs) {
-  year_vec <- as.integer(year_vec)
-  out <- numeric(length(x))
-  yrs <- unique(year_vec)
-  
-  for (yy in yrs) {
-    idx <- which(year_vec == yy)
-    # Expect idx length equals nrow(W_rs)=252
-    if (length(idx) != nrow(W_rs)) {
-      stop(sprintf("apply_W_by_year: year=%s has %d rows, expected %d (check balancing/sorting).",
-                   yy, length(idx), nrow(W_rs)))
-    }
-    out[idx] <- as.numeric(W_rs %*% as.numeric(x[idx]))
-  }
-  out
-}
+x_vars_loss <- c("y_loss_lag1", "fire_any", COVARS_LAG1)
+mu_loss_tr_pos <- predict_mu_star(m_loss, train_loss_nd, W_rs, ps_order = PS_FALLBACK_ORDER)
+Loss_tr_pos <- pmax(exp(mu_loss_tr_pos) * smear_loss - 1, 1e-8)
 
-# --- Predict severity on TRAIN ---
-mu_sev_train <- predict_mu_star(sev_star, train_df, W_rs, ps_order = PS_FALLBACK_ORDER)
-sev_hat_train <- inv_log1p_smear(mu_sev_train, smear_sev)
-sev_hat_train <- pmax(sev_hat_train, 1e-8)
+# Train: occurrence probability per model (clip)
+P1_tr <- pmin(pmax(as.numeric(predict_mu_star(m1_occ, train_df, W_rs, ps_order = PS_FALLBACK_ORDER)), 0), 1)
+P2_tr <- pmin(pmax(as.numeric(predict_mu_star(m2_occ, train_df, W_rs, ps_order = PS_FALLBACK_ORDER)), 0), 1)
+P3_tr <- pmin(pmax(as.numeric(predict_mu_star(m3_occ, train_df, W_rs, ps_order = PS_FALLBACK_ORDER)), 0), 1)
+P4_tr <- pmin(pmax(as.numeric(predict_mu_star(m4_occ, train_df, W_rs, ps_order = PS_FALLBACK_ORDER)), 0), 1)
+P5_tr <- pmin(pmax(as.numeric(predict_mu_star(m5_occ, train_df, W_rs, ps_order = PS_FALLBACK_ORDER)), 0), 1)
 
-# --- Predict frequency on TRAIN for each model ---
-mu1_tr <- predict_mu_star(m1_st,   train_df, W_rs, ps_order = PS_FALLBACK_ORDER)
-mu2_tr <- predict_mu_star(m2_st,   train_df, W_rs, ps_order = PS_FALLBACK_ORDER)
-mu3_tr <- predict_mu_star(m3_star, train_df, W_rs, ps_order = PS_FALLBACK_ORDER)
-mu4_tr <- predict_mu_star(m4_star, train_df, W_rs, ps_order = PS_FALLBACK_ORDER)
-mu5_tr <- predict_mu_star(m5_star, train_df, W_rs, ps_order = PS_FALLBACK_ORDER)
-
-n1_tr <- inv_log1p_smear(mu1_tr, smear_m1)
-n2_tr <- inv_log1p_smear(mu2_tr, smear_m2)
-n3_tr <- inv_log1p_smear(mu3_tr, smear_m3)
-n4_tr <- inv_log1p_smear(mu4_tr, smear_m4)
-n5_tr <- inv_log1p_smear(mu5_tr, smear_m5)
-
-ep1_tr <- pmax(n1_tr * sev_hat_train, 0)
-ep2_tr <- pmax(n2_tr * sev_hat_train, 0)
-ep3_tr <- pmax(n3_tr * sev_hat_train, 0)
-ep4_tr <- pmax(n4_tr * sev_hat_train, 0)
-ep5_tr <- pmax(n5_tr * sev_hat_train, 0)
+EP1_tr <- pmax(P1_tr * Loss_tr_pos, 0)
+EP2_tr <- pmax(P2_tr * Loss_tr_pos, 0)
+EP3_tr <- pmax(P3_tr * Loss_tr_pos, 0)
+EP4_tr <- pmax(P4_tr * Loss_tr_pos, 0)
+EP5_tr <- pmax(P5_tr * Loss_tr_pos, 0)
 
 actual_loss_train <- as.numeric(train_df$damage_capped)
-
 sum_actual_tr <- sum(actual_loss_train, na.rm = TRUE)
 
-safe_factor <- function(sum_actual, sum_pred) {
-  if (!is.finite(sum_pred) || sum_pred <= 0) return(1.0)
-  as.numeric(sum_actual / sum_pred)
-}
-
-c1 <- safe_factor(sum_actual_tr, sum(ep1_tr, na.rm=TRUE))
-c2 <- safe_factor(sum_actual_tr, sum(ep2_tr, na.rm=TRUE))
-c3 <- safe_factor(sum_actual_tr, sum(ep3_tr, na.rm=TRUE))
-c4 <- safe_factor(sum_actual_tr, sum(ep4_tr, na.rm=TRUE))
-c5 <- safe_factor(sum_actual_tr, sum(ep5_tr, na.rm=TRUE))
+c1 <- safe_factor(sum_actual_tr, sum(EP1_tr, na.rm=TRUE))
+c2 <- safe_factor(sum_actual_tr, sum(EP2_tr, na.rm=TRUE))
+c3 <- safe_factor(sum_actual_tr, sum(EP3_tr, na.rm=TRUE))
+c4 <- safe_factor(sum_actual_tr, sum(EP4_tr, na.rm=TRUE))
+c5 <- safe_factor(sum_actual_tr, sum(EP5_tr, na.rm=TRUE))
 
 calib_factors <- tibble(
-  model = c("M1: Mixed-ST (OLS)", "M2: Pure-ST (OLS)", "M3: Pure-STAR (SAR)", "M4: Mixed-STAR (SAR+X)", "M5: Res-STAR (SDM/Durbin)"),
+  model = c("M1: Mixed-ST (OLS)", "M2: Pure-ST (OLS)", "M3: Pure-STAR (SAR)",
+            "M4: Mixed-STAR (SAR+X)", "M5: Res-STAR (SDM/Durbin)"),
   calib_factor = c(c1, c2, c3, c4, c5)
 )
 
 print(calib_factors)
 
-msg(">>> [6/7] Predict 2025 (mu -> inverse log1p with smearing)...")
+msg(">>> [6/7] Predict 2025 (P_hat + conditional Loss_hat_pos)...")
 
-# Severity prediction: mu on log1p scale, then inverse with smearing
-mu_sev_hat <- predict_mu_star(sev_star, test_df, W_rs, ps_order = PS_FALLBACK_ORDER)
-sev_hat <- inv_log1p_smear(mu_sev_hat, smear_sev)
-# extra guard
-sev_hat <- pmax(sev_hat, 1e-8)
+# Test: conditional positive loss (set fire_any=1)
+test_loss_nd <- test_df
+test_loss_nd$fire_any <- 1
 
-# Frequency predictions (N_hat) for each model
-mu1 <- predict_mu_star(m1_st,   test_df, W_rs, ps_order = PS_FALLBACK_ORDER)
-mu2 <- predict_mu_star(m2_st,   test_df, W_rs, ps_order = PS_FALLBACK_ORDER)
-mu3 <- predict_mu_star(m3_star, test_df, W_rs, ps_order = PS_FALLBACK_ORDER)
-mu4 <- predict_mu_star(m4_star, test_df, W_rs, ps_order = PS_FALLBACK_ORDER)
-mu5 <- predict_mu_star(m5_star, test_df, W_rs, ps_order = PS_FALLBACK_ORDER)
+mu_loss_hat_pos <- predict_mu_star(m_loss, test_loss_nd, W_rs, ps_order = PS_FALLBACK_ORDER)
+Loss_hat_pos <- pmax(exp(mu_loss_hat_pos) * smear_loss - 1, 1e-8)
 
-n1 <- inv_log1p_smear(mu1, smear_m1)
-n2 <- inv_log1p_smear(mu2, smear_m2)
-n3 <- inv_log1p_smear(mu3, smear_m3)
-n4 <- inv_log1p_smear(mu4, smear_m4)
-n5 <- inv_log1p_smear(mu5, smear_m5)
+# Test: occurrence probability per model (clip)
+P1 <- pmin(pmax(as.numeric(predict_mu_star(m1_occ, test_df, W_rs, ps_order = PS_FALLBACK_ORDER)), 0), 1)
+P2 <- pmin(pmax(as.numeric(predict_mu_star(m2_occ, test_df, W_rs, ps_order = PS_FALLBACK_ORDER)), 0), 1)
+P3 <- pmin(pmax(as.numeric(predict_mu_star(m3_occ, test_df, W_rs, ps_order = PS_FALLBACK_ORDER)), 0), 1)
+P4 <- pmin(pmax(as.numeric(predict_mu_star(m4_occ, test_df, W_rs, ps_order = PS_FALLBACK_ORDER)), 0), 1)
+P5 <- pmin(pmax(as.numeric(predict_mu_star(m5_occ, test_df, W_rs, ps_order = PS_FALLBACK_ORDER)), 0), 1)
 
-# Combine EP
-ep1 <- pmax(n1 * sev_hat, 0)
-ep2 <- pmax(n2 * sev_hat, 0)
-ep3 <- pmax(n3 * sev_hat, 0)
-ep4 <- pmax(n4 * sev_hat, 0)
-ep5 <- pmax(n5 * sev_hat, 0)
+# EP
+EP1 <- pmax(P1 * Loss_hat_pos, 0)
+EP2 <- pmax(P2 * Loss_hat_pos, 0)
+EP3 <- pmax(P3 * Loss_hat_pos, 0)
+EP4 <- pmax(P4 * Loss_hat_pos, 0)
+EP5 <- pmax(P5 * Loss_hat_pos, 0)
 
-msg(">>> [7/7] Evaluate (raw vs calibrated) & save...")
+msg(">>> [7/7] Evaluate (RAW vs CAL) & save...")
 
 actual_cnt  <- test_df$fire_cnt_year
 actual_loss <- test_df$damage_capped
 
-# --- Apply calibration to TEST EP (EP only) ---
-ep1_adj <- ep1 * c1
-ep2_adj <- ep2 * c2
-ep3_adj <- ep3 * c3
-ep4_adj <- ep4 * c4
-ep5_adj <- ep5 * c5
+tol <- 1e-8
+eps <- 1e-8
+
+# Apply calibration to TEST EP (EP only)
+EP1_adj <- EP1 * c1
+EP2_adj <- EP2 * c2
+EP3_adj <- EP3 * c3
+EP4_adj <- EP4 * c4
+EP5_adj <- EP5 * c5
 
 res_raw <- bind_rows(
-  evaluate_models(actual_cnt, actual_loss, n1, ep1, "M1: Mixed-ST (OLS) [RAW]"),
-  evaluate_models(actual_cnt, actual_loss, n2, ep2, "M2: Pure-ST (OLS) [RAW]"),
-  evaluate_models(actual_cnt, actual_loss, n3, ep3, "M3: Pure-STAR (SAR) [RAW]"),
-  evaluate_models(actual_cnt, actual_loss, n4, ep4, "M4: Mixed-STAR (SAR+X) [RAW]"),
-  evaluate_models(actual_cnt, actual_loss, n5, ep5, "M5: Res-STAR (SDM/Durbin) [RAW]")
+  evaluate_models_occ(actual_cnt, actual_loss, P1, EP1, "M1: Mixed-ST (OLS) [RAW]", tol=tol, eps=eps),
+  evaluate_models_occ(actual_cnt, actual_loss, P2, EP2, "M2: Pure-ST (OLS) [RAW]", tol=tol, eps=eps),
+  evaluate_models_occ(actual_cnt, actual_loss, P3, EP3, "M3: Pure-STAR (SAR) [RAW]", tol=tol, eps=eps),
+  evaluate_models_occ(actual_cnt, actual_loss, P4, EP4, "M4: Mixed-STAR (SAR+X) [RAW]", tol=tol, eps=eps),
+  evaluate_models_occ(actual_cnt, actual_loss, P5, EP5, "M5: Res-STAR (SDM/Durbin) [RAW]", tol=tol, eps=eps)
 )
 
-res_adj <- bind_rows(
-  evaluate_models(actual_cnt, actual_loss, n1, ep1_adj, "M1: Mixed-ST (OLS) [CAL]"),
-  evaluate_models(actual_cnt, actual_loss, n2, ep2_adj, "M2: Pure-ST (OLS) [CAL]"),
-  evaluate_models(actual_cnt, actual_loss, n3, ep3_adj, "M3: Pure-STAR (SAR) [CAL]"),
-  evaluate_models(actual_cnt, actual_loss, n4, ep4_adj, "M4: Mixed-STAR (SAR+X) [CAL]"),
-  evaluate_models(actual_cnt, actual_loss, n5, ep5_adj, "M5: Res-STAR (SDM/Durbin) [CAL]")
+res_cal <- bind_rows(
+  evaluate_models_occ(actual_cnt, actual_loss, P1, EP1_adj, "M1: Mixed-ST (OLS) [CAL]", tol=tol, eps=eps),
+  evaluate_models_occ(actual_cnt, actual_loss, P2, EP2_adj, "M2: Pure-ST (OLS) [CAL]", tol=tol, eps=eps),
+  evaluate_models_occ(actual_cnt, actual_loss, P3, EP3_adj, "M3: Pure-STAR (SAR) [CAL]", tol=tol, eps=eps),
+  evaluate_models_occ(actual_cnt, actual_loss, P4, EP4_adj, "M4: Mixed-STAR (SAR+X) [CAL]", tol=tol, eps=eps),
+  evaluate_models_occ(actual_cnt, actual_loss, P5, EP5_adj, "M5: Res-STAR (SDM/Durbin) [CAL]", tol=tol, eps=eps)
 )
 
 strip_suffix <- function(x) gsub("\\s*\\[(RAW|CAL)\\]\\s*$", "", x)
 
-res <- bind_rows(res_raw, res_adj)
-
-strip_suffix <- function(x) gsub("\\s*\\[(RAW|CAL)\\]\\s*$", "", x)
-
-res <- res %>%
+res <- bind_rows(res_raw, res_cal) %>%
   mutate(
-    version = ifelse(grepl("\\[CAL\\]$", model), "CAL", "RAW"),
-    model_base = strip_suffix(model)
+    version    = if_else(grepl("\\[CAL\\]$", model_type), "CAL", "RAW"),
+    model_base = strip_suffix(model_type)
   ) %>%
   left_join(
     calib_factors %>% rename(model_base = model),
     by = "model_base"
   ) %>%
   mutate(
-    calib_factor = ifelse(version == "CAL", calib_factor, NA_real_)
+    calib_factor = if_else(version == "CAL", calib_factor, NA_real_)
   ) %>%
   dplyr::select(-model_base)
 
 print(res %>% arrange(desc(Spearman)))
 
 saveRDS(res, OUT_RDS)
-write.csv(res, OUT_CSV, row.names = FALSE)
+readr::write_csv(res, OUT_CSV)
 
 msg("Saved: %s", OUT_RDS)
 msg("Saved: %s", OUT_CSV)
-
